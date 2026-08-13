@@ -1,0 +1,28 @@
+{
+  "name": "pi-opencode-fix",
+  "version": "1.0.0",
+  "description": "Fix HTTP 429 FreeUsageLimitError when calling OpenCode DeepSeek models from Pi and Oh My Pi (omp)",
+  "main": "extensions/opencode-fix.ts",
+  "keywords": [
+    "pi-package",
+    "omp-plugin",
+    "opencode",
+    "deepseek",
+    "rate-limit-fix"
+  ],
+  "author": "Lutfi Zain <lutfidmz@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lutfi-zain/pi-opencode-fix.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/opencode-fix.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@oh-my-pi/pi-coding-agent": "*"
+  }
+}
