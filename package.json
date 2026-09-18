@@ -1,7 +1,7 @@
 {
   "name": "pi-opencode-fix",
-  "version": "1.0.0",
-  "description": "Fix HTTP 429 FreeUsageLimitError when calling OpenCode DeepSeek models from Pi and Oh My Pi (omp)",
+  "version": "1.1.0",
+  "description": "Fix HTTP 403 FreeTierError and HTTP 429 when calling OpenCode Zen / DeepSeek / Muse Spark models from Pi and Oh My Pi (omp)",
   "main": "extensions/opencode-fix.ts",
   "keywords": [
     "pi-package",

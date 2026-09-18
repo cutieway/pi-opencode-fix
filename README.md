@@ -1,18 +1,22 @@
 # pi-opencode-fix
 
-Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that fixes HTTP 429 `FreeUsageLimitError` when calling OpenCode Zen / DeepSeek models (such as `deepseek-v4-flash-free`).
+Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that fixes HTTP 403 `FreeTierError` and HTTP 429 `FreeUsageLimitError` when calling OpenCode Zen models (such as `muse-spark-1.3-contributor-free` and `deepseek-v4-flash-free`).
 
 ## Problem
 
-When using OpenCode models (e.g. `deepseek-v4-flash-free`) with `pi` or `omp`, requests fail with:
+When using OpenCode models with `pi` or `omp`, requests may fail with:
+```text
+403: {"type":"FreeTierError","message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}
+```
+or:
 ```text
 429: {"type":"FreeUsageLimitError","message":"Error from provider (Console): Rate limit exceeded. Please try again later."}
 ```
-This occurs because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1/chat/completions`) enforces a `User-Agent` check. If the `User-Agent` does not identify as `opencode`, the gateway returns a synthetic HTTP 429 error.
+This occurs because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1`) enforces client identity checks (`User-Agent`, `x-opencode-client`, `x-opencode-project`, and valid synchronized session/request timestamp IDs).
 
 ## Solution
 
-This extension automatically injects `User-Agent: opencode/latest/1.14.50/cli` into all outbound request headers targeting `opencode.ai` and configures provider headers for `opencode`, `opencode-go`, and `oc` in `pi` / `omp`.
+This extension automatically injects the official OpenCode CLI headers (`User-Agent: opencode/1.18.31...`, `x-opencode-client: cli`, `x-opencode-project: global`, and synchronized `x-opencode-session` / `x-opencode-request` identifiers) into all outbound request headers targeting `opencode.ai`, and configures provider headers for `opencode`, `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
 
 ## Installation
 
