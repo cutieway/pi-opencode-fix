@@ -8,7 +8,7 @@ let counter = 0;
 let lastTimestamp = 0;
 let sessionId: string | undefined;
 
-function generateId(prefix: "ses" | "prt", descending: boolean, timestamp = Date.now()): string {
+function generateId(prefix: "ses" | "msg", descending: boolean, timestamp = Date.now()): string {
   if (timestamp !== lastTimestamp) {
     lastTimestamp = timestamp;
     counter = 0;
@@ -33,18 +33,23 @@ function getSessionId(): string {
   return sessionId;
 }
 
-// OpenCode expects a stable session ID and a fresh `prt_` request ID per call.
+// OpenCode expects a stable session ID and a fresh `msg_` request ID per call.
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
   const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-  let hostname: string | undefined;
+  let requestUrlObject: URL | undefined;
   try {
-    hostname = new URL(requestUrl).hostname.toLowerCase();
+    requestUrlObject = new URL(requestUrl);
   } catch {
     // Leave non-URL fetch inputs untouched.
   }
 
-  if (hostname === "opencode.ai" || hostname?.endsWith(".opencode.ai")) {
+  const hostname = requestUrlObject?.hostname.toLowerCase();
+  const isZenApi =
+    (hostname === "opencode.ai" || hostname?.endsWith(".opencode.ai")) &&
+    (requestUrlObject?.pathname === "/zen" || requestUrlObject?.pathname.startsWith("/zen/"));
+
+  if (isZenApi) {
     const headers = new Headers(input instanceof Request ? input.headers : undefined);
     if (init?.headers) {
       new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -53,7 +58,7 @@ globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit)
     headers.set("x-opencode-client", "cli");
     headers.set("x-opencode-project", "global");
     headers.set("x-opencode-session", getSessionId());
-    headers.set("x-opencode-request", generateId("prt", false));
+    headers.set("x-opencode-request", generateId("msg", false));
     return originalFetch(input, { ...init, headers });
   }
 

@@ -16,18 +16,18 @@ This occurs because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1`) 
 
 ## Solution
 
-This extension automatically injects the official OpenCode CLI headers (`User-Agent: opencode/1.18.31...`, `x-opencode-client: cli`, `x-opencode-project: global`, and synchronized `x-opencode-session` / `x-opencode-request` identifiers) into all outbound request headers targeting `opencode.ai`, and configures provider headers for `opencode`, `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
+This extension injects OpenCode CLI identity headers only for requests to the Zen API path (`/zen` and `/zen/...`) on `opencode.ai` and its subdomains. It keeps a stable `ses_` session ID and generates a fresh ascending `msg_` request ID for each call, matching OpenCode's message-ID use for `x-opencode-request`. It also configures static provider headers for `opencode`, `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
 
 ## Installation
 
 ### For Pi (`pi`)
 ```bash
-pi install git:github.com/lutfi-zain/pi-opencode-fix
+pi install git:github.com/cutieway/pi-opencode-fix
 ```
 
 ### For Oh My Pi (`omp`)
 ```bash
-omp install git:github.com/lutfi-zain/pi-opencode-fix
+omp install git:github.com/cutieway/pi-opencode-fix
 ```
 
 ### Manual Installation
