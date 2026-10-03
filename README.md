@@ -16,7 +16,7 @@ This occurs because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1`) 
 
 ## Solution
 
-This extension injects OpenCode CLI identity headers only for requests to the Zen API path (`/zen` and `/zen/...`) on `opencode.ai` and its subdomains. It keeps a stable `ses_` session ID and generates a fresh ascending `msg_` request ID for each call, matching OpenCode's message-ID use for `x-opencode-request`. It also configures static provider headers for `opencode`, `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
+This extension injects OpenCode CLI identity headers only for requests to the Zen API path (`/zen` and `/zen/...`) on `opencode.ai` and its subdomains. It uses a minimal OpenCode-style user agent, keeps a stable `ses_` session ID, and generates a fresh ascending `msg_` request ID for each call unless the caller already supplied correctly formatted IDs. It also configures static provider headers for `opencode`, `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
 
 ## Installation
 

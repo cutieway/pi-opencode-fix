@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const OPENCODE_VERSION = "1.18.31";
-const USER_AGENT = `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14`;
+const USER_AGENT = `opencode/${OPENCODE_VERSION}`;
 
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let counter = 0;
@@ -33,6 +33,10 @@ function getSessionId(): string {
   return sessionId;
 }
 
+function isOpenCodeId(value: string | null, prefix: "ses" | "msg"): boolean {
+  return value !== null && new RegExp(`^${prefix}_[a-f0-9]{12}[0-9A-Za-z]{14}$`).test(value);
+}
+
 // OpenCode expects a stable session ID and a fresh `msg_` request ID per call.
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
@@ -57,8 +61,12 @@ globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit)
     headers.set("User-Agent", USER_AGENT);
     headers.set("x-opencode-client", "cli");
     headers.set("x-opencode-project", "global");
-    headers.set("x-opencode-session", getSessionId());
-    headers.set("x-opencode-request", generateId("msg", false));
+    if (!isOpenCodeId(headers.get("x-opencode-session"), "ses")) {
+      headers.set("x-opencode-session", getSessionId());
+    }
+    if (!isOpenCodeId(headers.get("x-opencode-request"), "msg")) {
+      headers.set("x-opencode-request", generateId("msg", false));
+    }
     return originalFetch(input, { ...init, headers });
   }
 
