@@ -1,6 +1,6 @@
 # pi-opencode-fix
 
-Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that fixes HTTP 403 `FreeTierError` and HTTP 429 `FreeUsageLimitError` when calling OpenCode Zen models (such as `muse-spark-1.3-contributor-free` and `deepseek-v4-flash-free`).
+Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that fixes HTTP 403 `FreeTierError` and HTTP 429 `FreeUsageLimitError` when calling OpenCode Zen models, whose free-model catalog changes over time.
 
 ## Problem
 
@@ -37,11 +37,18 @@ Copy `extensions/opencode-fix.ts` into:
 
 ## Usage
 
-Once installed, run `pi` or `omp` with any OpenCode model:
+OpenCode Zen's free-model catalog changes frequently, so check the current list before choosing a model:
 
 ```bash
-pi --model deepseek-v4-flash-free -p "hi"
-omp --model deepseek-v4-flash-free -p "hi"
+pi --list-models free
+omp models find free
+```
+
+For example, `muse-spark-1.3-contributor-free` is currently available. Select a model shown by your own model list; availability can change:
+
+```bash
+pi --model muse-spark-1.3-contributor-free -p "hi"
+omp --model muse-spark-1.3-contributor-free -p "hi"
 ```
 
 ## License
