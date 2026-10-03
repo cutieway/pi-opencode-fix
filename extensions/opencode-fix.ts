@@ -6,8 +6,9 @@ const USER_AGENT = `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/4.0.40 ru
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let counter = 0;
 let lastTimestamp = 0;
+let sessionId: string | undefined;
 
-function generateId(prefix: "ses" | "msg", descending: boolean, timestamp = Date.now()): string {
+function generateId(prefix: "ses" | "prt", descending: boolean, timestamp = Date.now()): string {
   if (timestamp !== lastTimestamp) {
     lastTimestamp = timestamp;
     counter = 0;
@@ -27,47 +28,42 @@ function generateId(prefix: "ses" | "msg", descending: boolean, timestamp = Date
   return `${prefix}_${timeHex}${rand}`;
 }
 
-// Monkey-patch globalThis.fetch to inject OpenCode CLI headers into all requests to opencode.ai
+function getSessionId(): string {
+  sessionId ??= generateId("ses", true);
+  return sessionId;
+}
+
+// OpenCode expects a stable session ID and a fresh `prt_` request ID per call.
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
-  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  let hostname: string | undefined;
+  try {
+    hostname = new URL(requestUrl).hostname.toLowerCase();
+  } catch {
+    // Leave non-URL fetch inputs untouched.
+  }
 
-  if (typeof url === "string" && url.includes("opencode.ai")) {
-    init = init || {};
-    const now = Date.now();
-    const sessionId = generateId("ses", true, now - 3000);
-    const requestId = generateId("msg", false, now);
-
-    const headersToInject: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-      "user-agent": USER_AGENT,
-      "x-opencode-client": "cli",
-      "x-opencode-project": "global",
-      "x-opencode-session": sessionId,
-      "x-opencode-request": requestId,
-    };
-
-    if (!init.headers) {
-      init.headers = headersToInject;
-    } else if (init.headers instanceof Headers) {
-      for (const [k, v] of Object.entries(headersToInject)) {
-        if (!init.headers.has(k) || k.toLowerCase() === "user-agent") {
-          init.headers.set(k, v);
-        }
-      }
-    } else if (Array.isArray(init.headers)) {
-      for (const [k, v] of Object.entries(headersToInject)) {
-        init.headers.push([k, v]);
-      }
-    } else {
-      Object.assign(init.headers, headersToInject);
+  if (hostname === "opencode.ai" || hostname?.endsWith(".opencode.ai")) {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    if (init?.headers) {
+      new Headers(init.headers).forEach((value, key) => headers.set(key, value));
     }
+    headers.set("User-Agent", USER_AGENT);
+    headers.set("x-opencode-client", "cli");
+    headers.set("x-opencode-project", "global");
+    headers.set("x-opencode-session", getSessionId());
+    headers.set("x-opencode-request", generateId("prt", false));
+    return originalFetch(input, { ...init, headers });
   }
 
   return originalFetch(input, init);
 };
 
 export default function (pi: ExtensionAPI) {
+  pi.on("session_start", () => {
+    sessionId = generateId("ses", true);
+  });
   const providers = ["oc", "opencode", "opencode-go", "opencode-zen"];
   for (const p of providers) {
     pi.registerProvider?.(p, {
