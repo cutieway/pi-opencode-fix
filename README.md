@@ -51,6 +51,10 @@ Copy `extensions/opencode-fix.ts` into:
 - `~/.pi/agent/extensions/opencode-fix.ts` (for `pi`)
 - `~/.omp/agent/extensions/opencode-fix.ts` (for `omp`)
 
+### Windows 11
+
+[`OMP-WINDOWS-SETUP.md`](OMP-WINDOWS-SETUP.md) is a self-contained prompt to hand to OpenCode on a Windows machine. It embeds this extension's source — nothing to download, install, or build — and then walks through the Zen credential, the free model roles, the advisor's tool slate, and how to capture request dumps when a request is still refused.
+
 ## Usage
 
 OpenCode Zen's free-model catalog changes frequently, so check the current list before choosing a model:
