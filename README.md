@@ -142,10 +142,16 @@ anything else is refused before running, so the relay can never spend Zen
 credits.
 
 Params: `prompt` (required), `model` (default
-`muse-spark-1.3-contributor-free`), `timeoutMs` (default 180000, max 600000).
-Output is capped at ~20k chars. Child stdin is closed so a prompt the CLI
-cannot ask (trust, permissions) fails fast instead of hanging; set
-`OPENCODE_BIN` to override the binary path.
+`muse-spark-1.3-contributor-free`), `timeoutMs` (default 180000, max 600000),
+`autoApprove` (default false: reads and answers work, permission-gated writes
+are denied; set true for coding tasks — same trust as the session's own
+edit/bash tools), `session` (a `[session: ses_…]` id from a previous answer,
+for multi-turn continuity; invented ids are rejected by the gateway).
+Answers name the nested run's tools (`[Nested opencode run used tools: …]`)
+and carry the nested session id for follow-ups. Output is capped at ~20k
+chars. Child stdin is closed so a prompt the CLI cannot ask (trust,
+permissions) fails fast instead of hanging; set `OPENCODE_BIN` to override
+the binary path.
 
 Requires `opencode` v2 installed and signed in (`opencode auth login`;
 `opencode service start` or one TUI launch for the background service).

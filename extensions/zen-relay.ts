@@ -38,6 +38,41 @@ function truncate(text: string, max: number): string {
   return text.slice(0, max) + `\n…[truncated, ${text.length - max} chars omitted]`;
 }
 
+/**
+ * Parse `opencode run --format json` (newline-delimited events) into the
+ * final text plus the names of tools the nested run used. Falls back to raw
+ * stdout when nothing parses.
+ */
+function parseRelayOutput(stdout: string): { text: string; tools: string[]; sessionId: string | null } {
+  const texts: string[] = [];
+  const tools: string[] = [];
+  let sessionId: string | null = null;
+  let parsedAny = false;
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    parsedAny = true;
+    if (typeof event.sessionID === "string" && sessionId === null) {
+      sessionId = event.sessionID;
+    }
+    const part = event.part as Record<string, unknown> | undefined;
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string") {
+      texts.push(part.text);
+    } else if (part.type === "tool" && typeof part.tool === "string") {
+      if (!tools.includes(part.tool)) tools.push(part.tool);
+    }
+  }
+  if (!parsedAny) return { text: stdout.trim(), tools: [], sessionId: null };
+  return { text: texts.join("\n").trim(), tools, sessionId };
+}
+
 interface RelayResult {
   code: number | null;
   stdout: string;
@@ -118,6 +153,16 @@ const paramsSchema = Type.Unsafe({
       type: "number",
       description: `Timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS}, max ${MAX_TIMEOUT_MS}).`,
     },
+    autoApprove: {
+      type: "boolean",
+      description:
+        "Auto-approve the nested run's permission-gated tools (file writes, shell). Default false: the nested run can read and answer but gated writes are denied. Set true for coding tasks, same trust as this session's own edit/bash tools.",
+    },
+    session: {
+      type: "string",
+      description:
+        "Nested session id for multi-turn continuity (passed as opencode --session). Use only ids previously returned by zen_ask; invented ids are rejected by the gateway.",
+    },
   },
   required: ["prompt"],
   additionalProperties: false,
@@ -127,6 +172,8 @@ interface ZenAskParams {
   prompt: string;
   model?: string;
   timeoutMs?: number;
+  autoApprove?: boolean;
+  session?: string;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -135,13 +182,18 @@ export default function (pi: ExtensionAPI) {
     label: "Ask free Zen model",
     description:
       "Ask a free OpenCode Zen model a question via the genuine opencode CLI and return its text answer. " +
-      "Use for second opinions, summaries, or reviews from models like muse-spark-1.3-contributor-free. " +
-      "Text in / text out: the nested run cannot use this session's tools and has no conversation context, " +
-      "so include everything it needs in prompt. It runs as its own agent turn in the session directory " +
-      "with opencode's own permission system. Only free models are accepted.",
+      "Use for second opinions, summaries, reviews, or small coding tasks on models like muse-spark-1.3-contributor-free. " +
+      "The nested run is its own agent with opencode's tools in the session directory: it can read files and, with autoApprove, write and run shell commands — but it cannot use this session's tools and has no conversation context, " +
+      "so include everything it needs in prompt. Pass session for multi-turn continuity. Only free models are accepted.",
     parameters: paramsSchema,
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-      const { prompt, model = DEFAULT_MODEL, timeoutMs = DEFAULT_TIMEOUT_MS } = params as ZenAskParams;
+      const {
+        prompt,
+        model = DEFAULT_MODEL,
+        timeoutMs = DEFAULT_TIMEOUT_MS,
+        autoApprove = false,
+        session,
+      } = params as ZenAskParams;
       if (typeof prompt !== "string" || prompt.trim() === "") {
         return {
           content: [{ type: "text", text: "zen_ask: prompt must be a non-empty string." }],
@@ -163,7 +215,11 @@ export default function (pi: ExtensionAPI) {
       }
       const timeout = Math.min(Math.max(Number(timeoutMs) || DEFAULT_TIMEOUT_MS, 10_000), MAX_TIMEOUT_MS);
       const cwd = ctx?.cwd || process.cwd();
-      const result = await runOpencode(["run", "--model", toProviderModel(model), prompt], cwd, timeout, signal);
+      const args = ["run", "--model", toProviderModel(model), "--format", "json"];
+      if (autoApprove === true) args.push("--auto");
+      if (typeof session === "string" && session.trim() !== "") args.push("--session", session.trim());
+      args.push(prompt);
+      const result = await runOpencode(args, cwd, timeout, signal);
 
       if (result.timedOut) {
         return {
@@ -185,16 +241,26 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
-      const answer = result.stdout.trim();
-      if (!answer) {
+      const raw = result.stdout.trim();
+      if (!raw) {
         return {
           content: [{ type: "text", text: "zen_ask: opencode run produced no output." }],
           details: undefined,
           isError: true,
         };
       }
+      const { text, tools, sessionId } = parseRelayOutput(raw);
+      if (!text) {
+        const note =
+          tools.length > 0
+            ? `zen_ask: nested run used tools (${tools.join(", ")}) but produced no text.`
+            : "zen_ask: opencode run produced no text output.";
+        return { content: [{ type: "text", text: note }], details: undefined, isError: true };
+      }
+      const activity = tools.length > 0 ? `\n\n[Nested opencode run used tools: ${tools.join(", ")}]` : "";
+      const continuity = sessionId ? `\n[session: ${sessionId}]` : "";
       return {
-        content: [{ type: "text", text: truncate(answer, MAX_OUTPUT_CHARS) }],
+        content: [{ type: "text", text: truncate(text, MAX_OUTPUT_CHARS) + activity + continuity }],
         details: undefined,
         isError: false,
       };
