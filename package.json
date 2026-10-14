@@ -18,7 +18,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/opencode-fix.ts"
+      "./extensions/opencode-fix.ts",
+      "./extensions/zen-relay.ts"
     ]
   },
   "peerDependencies": {

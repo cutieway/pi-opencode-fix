@@ -128,6 +128,28 @@ pi --model muse-spark-1.3-contributor-free -p "hi"
 omp --model muse-spark-1.3-contributor-free -p "hi"
 ```
 
+## Free models through the relay (`zen_ask`)
+
+`extensions/zen-relay.ts` makes free Zen models usable from inside `pi`/`omp`
+today, despite the gateway gate above: it registers a `zen_ask` tool that
+runs the genuine `opencode` binary (`opencode run --model opencode/<id>`)
+and returns its text answer. The nested run is a full agent turn with its own
+tools in the session directory — text in, text out. It cannot use the
+harness's tools or see its conversation, so put everything it needs in
+`prompt`. Only free models are accepted (id ends in `-free`, plus
+`big-pickle`; e.g. `muse-spark-1.3-contributor-free`, `space-bunny-free`) —
+anything else is refused before running, so the relay can never spend Zen
+credits.
+
+Params: `prompt` (required), `model` (default
+`muse-spark-1.3-contributor-free`), `timeoutMs` (default 180000, max 600000).
+Output is capped at ~20k chars. Child stdin is closed so a prompt the CLI
+cannot ask (trust, permissions) fails fast instead of hanging; set
+`OPENCODE_BIN` to override the binary path.
+
+Requires `opencode` v2 installed and signed in (`opencode auth login`;
+`opencode service start` or one TUI launch for the background service).
+
 ## License
 
 [MIT](LICENSE)
