@@ -25,7 +25,8 @@ The stricter gate described below was live from ~2026-10-13 through at least
 2026-10-15. Sometime between 2026-10-15 and 2026-10-19 the Zen gateway
 relaxed it. The fix that was refused on 2026-10-15 is the same code that
 answers `200` today; this release (1.3.1) only updates docs and comments and
-changes the relay's default model. Verified live on 2026-10-19
+changes the relay's default model (off the retired
+`muse-spark-1.3-contributor-free`). Verified live on 2026-10-19
 against `https://opencode.ai/zen/v1/chat/completions` with
 `deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`, and `space-bunny-free`:
 
@@ -72,9 +73,10 @@ bodies missing core OpenCode tool names get fail-open stubs appended
 disable. It also configures static provider headers for `opencode`,
 `opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
 
-Prerequisites for the registered-session path: `opencode` v2 installed and
-its background service running (`opencode service start`, or open the TUI
-once). Without the service the extension fails open to generated IDs.
+Prerequisites for the registered-session path: `opencode` installed (1.18.0
+or newer; 2.0.32 verified) and its background service running
+(`opencode service start`, or open the TUI once). Without the service the
+extension fails open to generated IDs.
 
 Env:
 
@@ -157,12 +159,21 @@ omp models find free
 For example, `deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`, and
 `space-bunny-free` are currently available. Select a model shown by your own
 model list; availability can change (`muse-spark-1.3-contributor-free` was
-retired on 2026-10-17 and now answers 410 `ModelDeprecated`):
+retired and now answers 410 `ModelDeprecated`):
 
 ```bash
-pi --model deepseek-v4.1-flash-free -p "hi"
+pi --model opencode/space-bunny-free -p "hi"
 omp --model opencode-zen/deepseek-v4.1-flash-free -p "hi"
 ```
+
+Both harnesses need their own Zen credential (`omp login opencode-zen`; for
+`pi`, the `opencode` provider reads `OPENCODE_API_KEY` or its `/login`).
+Provider-prefix the model id: `pi` resolves it as `opencode/<id>`, `omp` as
+`opencode-zen/<id>` (an unambiguous bare id also works on `omp`). The `omp`
+example is verified live; `pi` is not verified here (no Zen credential for
+`pi` on the author's machine), and its catalog may lag — `pi update --models`
+refreshes it, and an id missing from the catalog is sent as a custom model
+id.
 
 ## Free models through the relay (`zen_ask`)
 
@@ -190,9 +201,9 @@ chars. Child stdin is closed so a prompt the CLI cannot ask (trust,
 permissions) fails fast instead of hanging; set `OPENCODE_BIN` to override
 the binary path.
 
-Requires `opencode` v2 (1.18.0 or newer for free-tier requests) installed and
-signed in (`opencode auth login`; `opencode service start` or one TUI launch
-for the background service).
+Requires `opencode` 1.18.0 or newer (2.0.32 verified) installed and signed in
+(`opencode auth login`; `opencode service start` or one TUI launch for the
+background service).
 
 ## License
 

@@ -62,9 +62,9 @@ function isOpenCodeId(value: string | null, prefix: "ses" | "msg"): boolean {
 
 // --- local opencode service (registered sessions) ----------------------------
 // A registered session (`opencode service start`, or the TUI) is used when
-// available. It is no longer required: since the 2026-10-19 relaxation a
-// shape-valid generated `ses_` id passes the gateway too (and the genuine CLI
-// accepts one). Everything here fails open to generated IDs.
+// available. It is no longer required: the gateway relaxed by 2026-10-19, and
+// a shape-valid generated `ses_` id passes again (the genuine CLI accepts one
+// too). Everything here fails open to generated IDs.
 const OC_SERVICE_JSON = (() => {
   if (process.platform === "darwin") {
     return join(homedir(), "Library", "Application Support", "opencode", "service.json");
@@ -164,7 +164,7 @@ function resetSessionCache(): void {
 
 // --- tool-name gate ----------------------------------------------------------
 // The gateway validates tool NAMES in the body (schemas and descriptions are
-// ignored). Since the 2026-10-19 relaxation only a tool named `read` is
+// ignored). Since the gate relaxed (by 2026-10-19) only a tool named `read` is
 // required, but the full core set stays injected so the request also passes
 // if the gate tightens again. Bodies missing any of them get fail-open stubs
 // appended: the stubs are never registered in the harness, so a model call to

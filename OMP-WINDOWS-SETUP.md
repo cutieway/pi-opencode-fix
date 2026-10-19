@@ -27,8 +27,9 @@ those on its own, so the gateway refuses it before any model runs.
 Two things improve that: a small extension that adds those headers, and a credential for the Zen provider inside `omp`.
 
 > Status 2026-10-19: the gateway relaxed the strict gate it imposed around
-> 2026-10-13. The extension below works again with the same 1.3.0 build that
-> was refused on 2026-10-15. The current requirements are: `opencode` 1.18.0
+> 2026-10-13. The extension below works again with the same code that was
+> refused on 2026-10-15 (1.3.1 changes comments only). The current
+> requirements are: `opencode` 1.18.0
 > or newer (older versions get 426 `UpgradeRequired`), the extension's
 > identity headers, at least one tool named exactly `read`, and a streaming
 > request. A registered session is optional now; the extension falls back to
@@ -126,9 +127,9 @@ function isOpenCodeId(value: string | null, prefix: "ses" | "msg"): boolean {
 
 // --- local opencode service (registered sessions) ----------------------------
 // A registered session (`opencode service start`, or the TUI) is used when
-// available. It is no longer required: since the 2026-10-19 relaxation a
-// shape-valid generated `ses_` id passes the gateway too (and the genuine CLI
-// accepts one). Everything here fails open to generated IDs.
+// available. It is no longer required: the gateway relaxed by 2026-10-19, and
+// a shape-valid generated `ses_` id passes again (the genuine CLI accepts one
+// too). Everything here fails open to generated IDs.
 const OC_SERVICE_JSON = (() => {
   if (process.platform === "darwin") {
     return join(homedir(), "Library", "Application Support", "opencode", "service.json");
@@ -228,7 +229,7 @@ function resetSessionCache(): void {
 
 // --- tool-name gate ----------------------------------------------------------
 // The gateway validates tool NAMES in the body (schemas and descriptions are
-// ignored). Since the 2026-10-19 relaxation only a tool named `read` is
+// ignored). Since the gate relaxed (by 2026-10-19) only a tool named `read` is
 // required, but the full core set stays injected so the request also passes
 // if the gate tightens again. Bodies missing any of them get fail-open stubs
 // appended: the stubs are never registered in the harness, so a model call to
@@ -609,6 +610,8 @@ Reading the results:
 |---|---|
 | `403` with `error code: 1010` | Cloudflare refused it outright — no OpenCode identity at all, so the extension is not loaded or not applied. Check the file path and restart. |
 | `403` with `{"type":"error","error":{"type":"FreeTierError",...}}` | The gateway disliked the identity or refused this request shape. |
+| `426 UpgradeRequired` | The installed `opencode` is older than 1.18.0; upgrade it (the extension sends its version as the `User-Agent`). |
+| `410 ModelDeprecated` | The chosen free model was retired; run `omp models find free` and update Step 3. |
 | `402 Payment Required` | A paid Zen model was requested with no credits — a model role or fallback points at a paid model; recheck Step 3. |
 | Requests to `api.deepseek.com` or another paid host | The fallback chain is spending money; recheck Step 3. |
 | No `rr-session-*` files at all | `PI_REQ_DEBUG` did not reach the process. Set it in the same PowerShell window that launches `omp`. |
@@ -635,7 +638,8 @@ Send the following so the next person can continue from here:
 - Output of `omp plugins list`
 - Output of `omp models find free`
 - Whether `omp auth list` shows `opencode-zen`
-- The contents of `%USERPROFILE%\.omp\agent\config.yml` and `%USERPROFILE%\.omp\agent\WATCHDOG.yml`
+- The contents of `%USERPROFILE%\.omp\agent\config.yml` and, if Step 4 was
+  taken, `%USERPROFILE%\.omp\agent\WATCHDOG.yml`
 - If anything failed: the `rr-session-*.json` and `.res.log` files from Step 6, plus the exact error text
 
 If a `403` response body contains an `x-opencode-log-id` header, include that id — it is what upstream needs to trace a refusal.

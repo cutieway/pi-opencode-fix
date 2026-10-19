@@ -10,7 +10,7 @@ import { Type } from "typebox";
  * free-tier requests from third-party harnesses (403 FreeTierError) no matter
  * which client-identity headers were spoofed (see opencode-fix.ts and
  * README.md). The genuine CLI still passed, so this tool shells out to it:
- * text prompt in, text answer out. The gateway relaxed on 2026-10-19 and
+ * text prompt in, text answer out. The gateway relaxed by 2026-10-19 and
  * direct access works again, but the relay remains useful as an isolated
  * second opinion: the nested `opencode run` is a full agent turn with its own
  * tools in the session directory — it cannot see or call omp/pi tools, and
