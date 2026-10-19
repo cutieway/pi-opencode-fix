@@ -28,9 +28,9 @@ Two things improve that: a small extension that adds those headers, and a creden
 
 > Status 2026-10-19: the gateway relaxed the strict gate it imposed around
 > 2026-10-13. The extension below works again with the same code that was
-> refused on 2026-10-15 (1.3.1 changes comments only). The current
-> requirements are: `opencode` 1.18.0
-> or newer (older versions get 426 `UpgradeRequired`), the extension's
+> refused on 2026-10-15 (1.3.1 changed only comments in this extension).
+> The current requirements are: `opencode` 1.18.0 or newer (older versions
+> get 426 `UpgradeRequired`), the extension's
 > identity headers, at least one tool named exactly `read`, and a streaming
 > request. A registered session is optional now; the extension falls back to
 > generated IDs. The advisor's default tool slate passes, so the
