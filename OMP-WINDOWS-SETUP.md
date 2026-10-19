@@ -17,19 +17,23 @@ Everything needed is contained in this file. No other repository, download, or b
 403 OpenCode's free tier can only be used from within OpenCode (type=FreeTierError)
 ```
 
-OpenCode Zen's gateway restricts free-tier models to requests that look like they come from the OpenCode CLI itself: a versioned `User-Agent` (`opencode/latest/<version>/cli`), plus `x-opencode-client: cli`, several `x-opencode-session*` / `x-session*` session headers carrying a server-registered `ses_…` id, a fresh `msg_…` request id, and core OpenCode tool names in the body. `omp` sends none of those, so the gateway refuses it before any model runs.
+OpenCode Zen's gateway restricts free-tier models to requests that look like
+they come from the OpenCode CLI itself: a versioned `User-Agent`
+(`opencode/latest/<version>/cli`, version 1.18.0 or newer), a shape-valid
+`x-opencode-session` header carrying a `ses_…` id, at least one tool named
+exactly `read` in the body, and a streaming request. `omp` sends none of
+those on its own, so the gateway refuses it before any model runs.
 
 Two things improve that: a small extension that adds those headers, and a credential for the Zen provider inside `omp`.
 
-> Status 2026-10-14: upstream tightened the gate around 2026-10-13, and the
-> extension below no longer restores free models on its own — requests with
-> full header/session/tool parity are still refused, while the genuine
-> `opencode` CLI succeeds with the same key. The extension remains the
-> closest-possible, fail-open behavior (and helps if the gate relaxes), but
-> plan on using free models through `opencode` directly and keeping a
-> non-Zen fallback in `omp`. For the extension's registered-session path,
-> start the background service once (`opencode service start`, or open the
-> `opencode` TUI); without it the extension falls back to generated IDs.
+> Status 2026-10-19: the gateway relaxed the strict gate it imposed around
+> 2026-10-13. The extension below works again with the same 1.3.0 build that
+> was refused on 2026-10-15. The current requirements are: `opencode` 1.18.0
+> or newer (older versions get 426 `UpgradeRequired`), the extension's
+> identity headers, at least one tool named exactly `read`, and a streaming
+> request. A registered session is optional now; the extension falls back to
+> generated IDs. The advisor's default tool slate passes, so the
+> `WATCHDOG.yml` roster from the strict period is optional (Step 4).
 
 ## Step 0 — Baseline, before changing anything
 
@@ -121,10 +125,10 @@ function isOpenCodeId(value: string | null, prefix: "ses" | "msg"): boolean {
 }
 
 // --- local opencode service (registered sessions) ----------------------------
-// Since ~2026-10-13 the gateway rejects fabricated `ses_` IDs. A session ID
-// minted by the local background service (`opencode service start`, or the
-// TUI) is server-registered and passes. Everything here fails open: no
-// service means shape-valid generated IDs, exactly like v1.
+// A registered session (`opencode service start`, or the TUI) is used when
+// available. It is no longer required: since the 2026-10-19 relaxation a
+// shape-valid generated `ses_` id passes the gateway too (and the genuine CLI
+// accepts one). Everything here fails open to generated IDs.
 const OC_SERVICE_JSON = (() => {
   if (process.platform === "darwin") {
     return join(homedir(), "Library", "Application Support", "opencode", "service.json");
@@ -223,11 +227,13 @@ function resetSessionCache(): void {
 }
 
 // --- tool-name gate ----------------------------------------------------------
-// The gateway counts core OpenCode tool NAMES in the body (schemas and
-// descriptions are ignored). Bodies missing them get fail-open stubs appended:
-// the stubs are never registered in the harness, so a model call to one
-// errors and the model recovers. Skipped for forced tool_choice (a stub would
-// be invoked for sure) and for non-string bodies. Disable with
+// The gateway validates tool NAMES in the body (schemas and descriptions are
+// ignored). Since the 2026-10-19 relaxation only a tool named `read` is
+// required, but the full core set stays injected so the request also passes
+// if the gate tightens again. Bodies missing any of them get fail-open stubs
+// appended: the stubs are never registered in the harness, so a model call to
+// one errors and the model recovers. Skipped for forced tool_choice (a stub
+// would be invoked for sure) and for non-string bodies. Disable with
 // ZEN_INJECT_TOOLS=0.
 const ZEN_REQUIRED_TOOL_NAMES = ["bash", "read", "edit", "glob", "grep"];
 const STUB_DESCRIPTION = "Gateway-validation stub. NOT IMPLEMENTED - never call this tool.";
@@ -477,11 +483,10 @@ Edit `%USERPROFILE%\.omp\agent\config.yml`, creating it if it does not exist. Me
 
 ```yaml
 modelRoles:
-  # The reviewer and the tool-less auxiliary tasks use space-bunny-free:
-  # muse-spark refuses the tool-less request shape outright.
+  # The reviewer and the tool-less auxiliary tasks use space-bunny-free.
   advisor: opencode-zen/space-bunny-free
   tiny: opencode-zen/space-bunny-free
-  default: opencode-zen/muse-spark-1.3-contributor-free:xhigh
+  default: opencode-zen/deepseek-v4.1-flash-free:max
   # Every other chat role follows the default role through `*`. Roles other
   # than smol/slow inherit nothing on their own, so an unset plan, commit,
   # vision, memory, or task can resolve to a paid model instead.
@@ -508,13 +513,21 @@ Confirm it parses:
 omp config get modelRoles
 ```
 
-Both models named above are free Zen models. `muse-spark-1.3-contributor-free` serves the main agent and speaks the Responses API. `space-bunny-free` speaks chat completions and is the one that accepts tool-less requests.
+Both models named above are free Zen models and both serve chat completions.
+`deepseek-v4.1-flash-free` is the current general-purpose free model;
+`space-bunny-free` is the current advisor model. Do not use
+`muse-spark-1.3-contributor-free`: it was retired on 2026-10-17 and now
+returns 410 `ModelDeprecated`. Check `omp models find free` before choosing a
+different id.
 
-## Step 4 — Give the advisor a larger tool slate
+## Step 4 — (Optional) Give the advisor a larger tool slate
 
-`omp`'s built-in advisor/reviewer role runs with only `read`, `grep`, `glob`, plus its own `advise` tool, and that four-name shape is refused by the gateway. A roster entry replaces the slate, and only a roster file can express it: the global `advisor:` block has no `tools` key.
+This step is a workaround from the strict period and is no longer required.
+The advisor's default slate (`advise`, `read`, `glob`, `grep`) passes the
+current gateway because it contains `read`.
 
-Create `%USERPROFILE%\.omp\agent\WATCHDOG.yml`:
+Skip this step unless the user wants a full-agent advisor that can edit files
+and run commands. In that case create `%USERPROFILE%\.omp\agent\WATCHDOG.yml`:
 
 ```yaml
 advisors:
@@ -534,9 +547,12 @@ advisors:
       - write
 ```
 
-Everything else about the advisor keeps its defaults: the model comes from `modelRoles.advisor`, and the system prompt is built in.
+Everything else about the advisor keeps its defaults: the model comes from
+`modelRoles.advisor`, and the system prompt is built in.
 
-One consequence to state plainly to the user: this makes the advisor a full agent, able to edit files and run commands through those tools. If a read-only reviewer is preferred, drop `bash`, `edit`, `eval`, and `write` from the list — accepting that a smaller slate may be refused again by the gateway.
+One consequence to state plainly to the user: this makes the advisor a full
+agent, able to edit files and run commands through those tools. If a
+read-only reviewer is preferred, leave `WATCHDOG.yml` absent.
 
 ## Step 5 — Verify
 
@@ -546,7 +562,10 @@ Single-shot check:
 omp --model opencode-zen/space-bunny-free -p "reply with exactly: harness-ok"
 ```
 
-Expect `harness-ok`, with no warning about a fallback model.
+Expect `harness-ok`, with no warning about a fallback model. If the answer
+appears but the log shows `403 ... (type=FreeTierError)` followed by a
+fallback model, the extension is not loaded — recheck Step 1 rather than the
+model roles.
 
 Then start an interactive session so the advisor fires on the reply:
 

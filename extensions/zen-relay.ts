@@ -6,19 +6,21 @@ import { Type } from "typebox";
  * zen_ask — consult a free OpenCode Zen model through the genuine `opencode`
  * binary and return its text answer.
  *
- * Why this exists: since ~2026-10-13 the Zen gateway refuses free-tier
- * requests from third-party harnesses (403 FreeTierError) no matter which
- * client-identity headers are spoofed (see opencode-fix.ts and README.md).
- * The genuine CLI still passes, so this tool shells out to it: text prompt
- * in, text answer out. The nested `opencode run` is a full agent turn with
- * its own tools in the session directory — it cannot see or call omp/pi
- * tools, and omp/pi cannot steer its tool use beyond the prompt text.
+ * Why this exists: it was added on 2026-10-14, when the Zen gateway refused
+ * free-tier requests from third-party harnesses (403 FreeTierError) no matter
+ * which client-identity headers were spoofed (see opencode-fix.ts and
+ * README.md). The genuine CLI still passed, so this tool shells out to it:
+ * text prompt in, text answer out. The gateway relaxed on 2026-10-19 and
+ * direct access works again, but the relay remains useful as an isolated
+ * second opinion: the nested `opencode run` is a full agent turn with its own
+ * tools in the session directory — it cannot see or call omp/pi tools, and
+ * omp/pi cannot steer its tool use beyond the prompt text.
  *
  * Cost guard: only free models are allowed (id ends in `-free`, plus
  * `big-pickle`). Paid model ids are rejected before anything runs.
  */
 
-const DEFAULT_MODEL = "muse-spark-1.3-contributor-free";
+const DEFAULT_MODEL = "deepseek-v4.1-flash-free";
 const DEFAULT_TIMEOUT_MS = 180_000;
 const MAX_TIMEOUT_MS = 600_000;
 const MAX_OUTPUT_CHARS = 20_000;
@@ -161,7 +163,7 @@ const paramsSchema = Type.Unsafe({
     session: {
       type: "string",
       description:
-        "Nested session id for multi-turn continuity (passed as opencode --session). Use only ids previously returned by zen_ask; invented ids are rejected by the gateway.",
+        "Nested session id for multi-turn continuity (passed as opencode --session). Use only ids previously returned by zen_ask; a shape-valid invented id is accepted by the CLI but carries no context.",
     },
   },
   required: ["prompt"],
@@ -182,7 +184,7 @@ export default function (pi: ExtensionAPI) {
     label: "Ask free Zen model",
     description:
       "Ask a free OpenCode Zen model a question via the genuine opencode CLI and return its text answer. " +
-      "Use for second opinions, summaries, reviews, or small coding tasks on models like muse-spark-1.3-contributor-free. " +
+      "Use for second opinions, summaries, reviews, or small coding tasks on models like deepseek-v4.1-flash-free. " +
       "The nested run is its own agent with opencode's tools in the session directory: it can read files and, with autoApprove, write and run shell commands — but it cannot use this session's tools and has no conversation context, " +
       "so include everything it needs in prompt. Pass session for multi-turn continuity. Only free models are accepted.",
     parameters: paramsSchema,
