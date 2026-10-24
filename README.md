@@ -1,6 +1,6 @@
 # pi-opencode-fix
 
-Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that fixes HTTP 403 `FreeTierError` and HTTP 429 `FreeUsageLimitError` when calling OpenCode Zen models, whose free-model catalog changes over time.
+Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that gives requests to OpenCode Zen the identity and prompt shape of the genuine OpenCode CLI, so free models answer directly in the harness, plus a 429 circuit breaker so a real quota day fails fast with the reset time.
 
 ## Problem
 
@@ -12,23 +12,86 @@ or:
 ```text
 429: {"type":"FreeUsageLimitError","message":"Error from provider (Console): Rate limit exceeded. Please try again later."}
 ```
-This occurs because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1`)
-accepts free-tier requests only from clients that look like the OpenCode CLI:
-an OpenCode `User-Agent` at version 1.18.0 or newer, a shape-valid
-`x-opencode-session` id, at least one tool named `read`, and a streaming
-body. `pi`/`omp` send none of those, so the gateway refuses them before any
-model runs.
+This happens because the OpenCode Zen API gateway (`https://opencode.ai/zen/v1`)
+serves free-tier requests only to clients that look like the OpenCode CLI. Two
+checks are stacked in front of the model:
 
-## Status (2026-10-19): working again — the gateway relaxed
+- a request-shape check that answers `403 FreeTierError` when the OpenCode
+  `User-Agent`, a shape-valid `x-opencode-session` id, a tool, or a streaming
+  body is missing;
+- a prompt-shape check (since 2026-10-24) that wants an `<env>` … `</env>`
+  block in the system message and answers `429 FreeUsageLimitError` without it
+  — or `403 FreeTierError` when the rest of the prompt is also far from
+  OpenCode's own.
 
-The stricter gate described below was live from ~2026-10-13 through at least
-2026-10-15. Sometime between 2026-10-15 and 2026-10-19 the Zen gateway
-relaxed it. The fix that was refused on 2026-10-15 is the same code that
-answers `200` today; this release (1.3.1) only updates docs and comments and
-changes the relay's default model (off the retired
-`muse-spark-1.3-contributor-free`). Verified live on 2026-10-19
+`pi`/`omp` satisfy neither on their own, so the gateway refuses them before any
+model runs. See
+[Status](#status-2026-10-24-working-the-429-is-an-env-block-check).
+
+## Status (2026-10-24): working — the 429 is an `<env>` block check
+
+On 2026-10-24 every forged request to the free lane started coming back
+`429 FreeUsageLimitError`, while the genuine `opencode run` on the same key,
+same IP, same minute answered `200`. That looked like per-day metering. It was
+not: the `429` is a second shape check, and the thing it looks for is an
+`<env>` … `</env>` block in the **system message**. Replaying the captured
+genuine request with Bun's `fetch` reproduces `200`; changing that one part of
+the body flips it to `429` and back:
+
+| Variant of the captured genuine request | Result |
+|---|---|
+| unchanged (replayed over HTTP/1.1 and HTTP/2) | 200 |
+| system prompt replaced with a generic one | 429 |
+| system prompt removed | 429 |
+| system prompt truncated to its first 6000 / 2000 / 600 / 170 characters | 429 |
+| only the last 600 characters of the system prompt | 200 |
+| system message set to `<env></env>` | 200 |
+| system message set to `<env>` (no close tag) | 429 |
+| system message set to `<ENV></ENV>` | 429 |
+| system message set to `<env>garbage</env>` | 200 |
+| the same `<env></env>` block moved to a user message | 429 |
+| env block present, all tools removed | 403 `FreeTierError` (the older shape check) |
+
+So the check is a heuristic, not a signature: tag names are matched
+case-sensitively and the content between them is ignored. A missing block is
+usually a `429`, but a harness prompt that differs more from OpenCode's own
+can get the older `403 FreeTierError` instead — both disappear once the block
+is present. Fresh session and project IDs pass, and the stored key is not the
+discriminator (the harness key and the opencode key are byte-identical).
+OpenCode's own prompt always carries an env block, so the gateway presumably
+uses it as its "is this our agent loop?" marker.
+
+Since 1.4.0 the extension appends that block to the system message of every
+`opencode.ai` JSON request that lacks one, and creates a system message if the
+harness sent none. It appends rather than prepends, so the harness prompt keeps
+its position. Verified live: `omp` 18.12.6 then answered through
+`opencode-zen/deepseek-v4.1-flash-free` in ~7 s, executed a shell tool call in
+the same turn, and produced reasoning with `--thinking high`; the same works on
+`glm-5.3-flash-free`.
+
+The **429 circuit breaker** stays, because a `429` with `retry-after` can still
+be a real bucket limit:
+
+- on a 429 it records the deadline from `retry-after-ms` or `retry-after`,
+  keyed by model, and appends the reset time to the error body, because the
+  server's body does not say when the bucket refills;
+- a 429 on a request that never carried the block (env injection disabled, or
+  a body the patch could not rewrite) is treated as a shape rejection and
+  blocked for a minute instead of a day;
+- later requests for that model fail immediately with `ZenFreeLimitError`
+  naming the reset time, without touching the network;
+- the deadline is persisted in `<tmpdir>/zen-free-tier-limit.json` so separate
+  `omp -p` / `pi -p` runs honour it too (each run is a new process). Delete the
+  file to retry early; `ZEN_429_BREAKER=0` disables the breaker.
+
+## History: the earlier shape check
+
+Before the env check there was a stricter request-shape gate, live from
+~2026-10-13 through at least 2026-10-15. It relaxed on its own: the fix refused
+on 2026-10-15 answered `200` from 2026-10-19. Verified live on 2026-10-19
 against `https://opencode.ai/zen/v1/chat/completions` with
-`deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`, and `space-bunny-free`:
+`deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`, and `space-bunny-free`
+(retired since):
 
 | Request | Result |
 |---|---|
@@ -43,54 +106,69 @@ against `https://opencode.ai/zen/v1/chat/completions` with
 | `read` + any `tool_choice` (`none` / `auto` / `required`) | 200 |
 | `/zen/v1/responses` | 400 `ModelProtocolUnsupported` for free models |
 
-The current rule is therefore: an OpenCode `User-Agent` at version 1.18.0 or
+During that window the rule was: an OpenCode `User-Agent` at version 1.18.0 or
 newer, one shape-valid session ID, at least one tool named exactly `read`,
-and a streaming request. A server-registered session is no longer required;
-generated shape-valid IDs pass, and the genuine CLI accepts them too.
+and a streaming request. A server-registered session was not required;
+generated shape-valid IDs passed, and the genuine CLI accepted them too.
 
-`omp` 18.12.2 with this extension now answers through Zen directly, including
-the advisor's default `advise`/`read`/`glob`/`grep` slate. The
+`omp` 18.12.2 with this extension answered through Zen directly, including the
+advisor's default `advise`/`read`/`glob`/`grep` slate. The
 `WATCHDOG.yml` tool-roster workaround from the strict period is no longer
 needed; keeping it still works but turns the advisor into a full agent.
 
-The extension is still required. Verified on 2026-10-19 with
-`omp --no-extensions`: both `deepseek-v4.1-flash-free` and
-`space-bunny-free` returned 403 `FreeTierError`, and the printed answer came
-from the `retry.fallbackChains` fallback to `deepseek/deepseek-v4-flash-vision-exp`.
-Unpatched `pi`/`omp` requests lack the identity headers and the `read` tool
-name, so they are refused.
+The identity headers are still required whenever the lane is open. Verified on
+2026-10-19 with `omp --no-extensions`: both free models returned 403
+`FreeTierError`, and the printed answer came from the
+`retry.fallbackChains` fallback to `deepseek/deepseek-v4-flash-vision-exp`
+(remove that chain: it bills a paid model behind the user's back).
 
 ## Solution
 
-This extension injects OpenCode CLI identity headers for requests to
-`opencode.ai` and its subdomains. It uses the v2 user agent
-(`opencode/latest/<local-version>/cli`, read from the installed `opencode`
-binary), a server-registered session ID from the local opencode background
-service when available (falling back to a shape-valid generated ID), all five
-session-header variants, and a fresh `msg_` request ID per call. String JSON
-bodies missing core OpenCode tool names get fail-open stubs appended
-(skipped for forced `tool_choice`); see `ZEN_INJECT_TOOLS=0` below to
-disable. It also configures static provider headers for `opencode`,
-`opencode-go`, `opencode-zen`, and `oc` in `pi` / `omp`.
+This extension patches requests to `opencode.ai` and its subdomains so they look
+like the genuine client:
+
+- OpenCode CLI identity headers: the v2 user agent
+  (`opencode/latest/<local-version>/cli`, read from the installed `opencode`
+  binary), a server-registered session ID from the local opencode background
+  service when available (falling back to a shape-valid generated ID), all five
+  session-header variants, and a fresh `msg_` request ID per call.
+- An `<env>` … `</env>` block in the system message, appended if missing (see
+  [Status](#status-2026-10-24-working-the-429-is-an-env-block-check)).
+- Fail-open stubs for core OpenCode tool names on string JSON bodies that lack
+  them (skipped for forced `tool_choice`); see `ZEN_INJECT_TOOLS=0` below.
+
+It also configures static provider headers for `opencode`, `opencode-go`,
+`opencode-zen`, and `oc` in `pi` / `omp`, and keeps a per-model 429 deadline so
+a real free-model quota day fails fast with the reset time instead of
+retrying.
 
 Prerequisites for the registered-session path: `opencode` installed (1.18.0
-or newer; 2.0.32 verified) and its background service running
+or newer; 2.1.4 verified) and its background service running
 (`opencode service start`, or open the TUI once). Without the service the
 extension fails open to generated IDs.
 
 Env:
 
+- `ZEN_INJECT_ENV=0` — disable env-block injection (headers and tools still
+  patched; requests are answered with `429 FreeUsageLimitError`)
 - `ZEN_INJECT_TOOLS=0` — disable tool-stub injection (headers still patched)
+- `ZEN_429_BREAKER=0` — disable the 429 circuit breaker (requests are still
+  annotated with the reset time)
 - `ZEN_HEADERS_DEBUG=1` — append one line per Zen request to
-  `<tmpdir>/zen-free-tier-headers.log` (path, session prefix, tool counts;
-  never keys)
+  `<tmpdir>/zen-free-tier-headers.log` (path, session prefix, tool and env
+  flags, 429 deadline; never keys)
 - `OPENCODE_SERVER_URL` — override the background service URL
 
 Known limits:
 
+- The env check is server-side and undocumented; a future change can add a
+  condition this extension does not satisfy. The flags above and
+  `ZEN_HEADERS_DEBUG=1` are there to tell a shape rejection (`429` with no
+  request in the log, or `403`) apart from a real limit (`429` with
+  `retry-after`).
 - One Zen request per `omp` run bypassed `globalThis.fetch` with `omp/18.10.2`
   despite the patch and could not be patched from an extension. On
-  `omp/18.12.2` headless runs, every observed Zen call went through the
+  `omp/18.12.6` headless runs, every observed Zen call went through the
   patch; if a turn still returns 403, capture it with `ZEN_HEADERS_DEBUG=1`
   and check whether a request is missing from the log.
 - Session rotation on 403 is capped (3 per process). A 403 now usually means
@@ -103,19 +181,27 @@ Known limits:
 ### Request-shape check
 
 Identity headers are not the whole story: the gateway also validates the
-body. The current minimum (measured 2026-10-19) is one tool named exactly
-`read` plus `"stream": true`. A tool-less body, a non-streaming body, or a
-slate without `read` is refused with 403 `FreeTierError`; `bash`, `edit`,
-`glob`, `grep`, `write`, and `task` alone are all refused. The `read`
-schema is ignored, so `{"type":"object","properties":{}}` passes.
-`tool_choice` is not checked. Free models serve chat completions only:
-`/zen/v1/responses` returns 400 `ModelProtocolUnsupported`.
+body. Two checks run in order:
+
+1. **Shape** (answers `403 FreeTierError`): an OpenCode `User-Agent` at
+   version 1.18.0 or newer, a shape-valid session ID, at least one tool named
+   exactly `read`, and `"stream": true`. A tool-less or non-streaming body is
+   refused; `bash`, `edit`, `glob`, `grep`, `write`, and `task` alone are all
+   refused. The `read` schema is ignored, so `{"type":"object","properties":{}}`
+   passes. `tool_choice` is not checked.
+2. **Prompt shape** (answers `429 FreeUsageLimitError`): the system message
+   must contain `<env>` … `</env>`. Case-sensitive, content ignored, and it
+   has to be the system message — the same block in a user message does not
+   count.
+
+Free models serve chat completions only: `/zen/v1/responses` returns 400
+`ModelProtocolUnsupported`.
 
 Since 1.2.0 the extension appends fail-open stubs for the five core names
 (`bash`, `read`, `edit`, `glob`, `grep`) to string JSON bodies that lack
 them. This is what lets tool-less auxiliary calls (titles, summaries) pass
-today: the injected `read` satisfies the gate. Stubs are never registered in
-the harness, so a model call to one errors and the model recovers. The full
+today: the injected `read` satisfies the 403 check. Stubs are never registered
+in the harness, so a model call to one errors and the model recovers. The full
 core set stays injected so the request also passes if the gate tightens
 again. `ZEN_INJECT_TOOLS=0` disables injection.
 
@@ -156,13 +242,15 @@ pi --list-models free
 omp models find free
 ```
 
-For example, `deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`, and
-`space-bunny-free` are currently available. Select a model shown by your own
-model list; availability can change (`muse-spark-1.3-contributor-free` was
-retired and now answers 410 `ModelDeprecated`):
+For example, `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`,
+`mimo-v2.6-flash-free`, `beam-free`, `jev-1.13-free`, and `big-pickle` were in
+the catalog on 2026-10-24. Select a model shown by your own model list;
+availability changes (`space-bunny-free` and
+`muse-spark-1.3-contributor-free` were retired, the latter now answers 410
+`ModelDeprecated`):
 
 ```bash
-pi --model opencode/space-bunny-free -p "hi"
+pi --model opencode/deepseek-v4.1-flash-free -p "hi"
 omp --model opencode-zen/deepseek-v4.1-flash-free -p "hi"
 ```
 
@@ -179,14 +267,16 @@ id.
 
 `extensions/zen-relay.ts` registers a `zen_ask` tool that runs the genuine
 `opencode` binary (`opencode run --model opencode/<id>`) and returns its text
-answer. It was added while the gateway refused `pi`/`omp` outright; direct
-access works again, so treat it as an optional second opinion / isolation
-path rather than the only way in. The nested run is a full agent turn with
-its own tools in the session directory — text in, text out. It cannot use the
-harness's tools or see its conversation, so put everything it needs in
-`prompt`. Only free models are accepted (id ends in `-free`, plus
-`big-pickle`; e.g. `deepseek-v4.1-flash-free`, `space-bunny-free`) — anything
-else is refused before running, so the relay can never spend Zen credits.
+answer. It was written while the gateway refused `pi`/`omp` outright; direct
+access works again, so treat it as an optional second opinion or isolation
+path rather than the only way in. It inherits the real client identity, so it
+keeps working even if the gateway adds a check this extension does not
+satisfy. The nested run is a full agent turn with its own tools in the session
+directory — text in, text out. It cannot use the harness's tools or see its
+conversation, so put everything it needs in `prompt`. Only free models are
+accepted (id ends in `-free`, plus `big-pickle`; e.g.
+`deepseek-v4.1-flash-free`, `glm-5.3-flash-free`) — anything else is refused
+before running, so the relay can never spend Zen credits.
 
 Params: `prompt` (required), `model` (default
 `deepseek-v4.1-flash-free`), `timeoutMs` (default 180000, max 600000),

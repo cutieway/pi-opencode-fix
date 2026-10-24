@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile, appendFile } from "node:fs/promises";
+import { readFile, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
@@ -162,6 +162,61 @@ function resetSessionCache(): void {
   fallbackSessionId = generateId("ses", true);
 }
 
+// --- env-block gate ----------------------------------------------------------
+// Since 2026-10-24 the gateway answers 429 `FreeUsageLimitError` (which reads
+// like "out of quota" but is a client check) to any request whose system
+// message lacks an `<env>` ... `</env>` block. Measured: `<env></env>` in the
+// system message passes, the same block in a user message does not, and the
+// content between the tags is ignored. OpenCode's own prompt always carries
+// one, so the gateway apparently uses it as its "is this our agent loop"
+// signal. The block appended here is the same shape OpenCode sends, with the
+// values the harness can actually observe. It is appended, never prepended, so
+// the harness prompt stays first. Disable with ZEN_INJECT_ENV=0.
+const ENV_OPEN = "<env>";
+const ENV_CLOSE = "</env>";
+
+function envBlock(): string {
+  return [
+    ENV_OPEN,
+    `  Working directory: ${process.cwd()}`,
+    `  Platform: ${process.platform}`,
+    ENV_CLOSE,
+  ].join("\n");
+}
+
+type JsonObject = Record<string, unknown>;
+
+function hasEnvBlock(text: string): boolean {
+  const open = text.indexOf(ENV_OPEN);
+  return open >= 0 && text.indexOf(ENV_CLOSE, open + ENV_OPEN.length) >= 0;
+}
+
+// Appends the block to the first system/developer message; if the harness sent
+// no system message at all, one is created so the gateway sees the marker.
+function injectZenEnv(body: JsonObject): { changed: boolean; added: boolean } {
+  const messages = Array.isArray(body.messages) ? (body.messages as JsonObject[]) : null;
+  if (!messages) return { changed: false, added: false };
+  const system = messages.find((m) => m && (m.role === "system" || m.role === "developer"));
+  if (!system) {
+    messages.unshift({ role: "system", content: envBlock() });
+    return { changed: true, added: true };
+  }
+  const content = system.content;
+  if (typeof content === "string") {
+    if (hasEnvBlock(content)) return { changed: false, added: false };
+    system.content = `${content}\n\n${envBlock()}`;
+    return { changed: true, added: true };
+  }
+  if (Array.isArray(content)) {
+    const parts = content as JsonObject[];
+    const text = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+    if (hasEnvBlock(text)) return { changed: false, added: false };
+    parts.push({ type: "text", text: envBlock() });
+    return { changed: true, added: true };
+  }
+  return { changed: false, added: false };
+}
+
 // --- tool-name gate ----------------------------------------------------------
 // The gateway validates tool NAMES in the body (schemas and descriptions are
 // ignored). Since the gate relaxed (by 2026-10-19) only a tool named `read` is
@@ -210,8 +265,17 @@ function isForcedToolChoice(choice: unknown): boolean {
   return false;
 }
 
-function injectZenTools(url: string, bodyText: string): { text: string; injected: string[]; present: number } {
-  const passthrough = { text: bodyText, injected: [] as string[], present: 0 };
+function injectZenTools(
+  url: string,
+  bodyText: string,
+): { text: string; injected: string[]; present: number; envAdded: boolean; model: string } {
+  const passthrough = {
+    text: bodyText,
+    injected: [] as string[],
+    present: 0,
+    envAdded: false,
+    model: "",
+  };
   let doc: unknown;
   try {
     doc = JSON.parse(bodyText);
@@ -220,23 +284,28 @@ function injectZenTools(url: string, bodyText: string): { text: string; injected
   }
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return passthrough;
   const body = doc as Record<string, unknown>;
+  const model = typeof body.model === "string" ? body.model : "";
+
+  let envAdded = false;
+  if (process.env.ZEN_INJECT_ENV !== "0") {
+    envAdded = injectZenEnv(body).changed;
+  }
+
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : null;
   const names = (tools ?? []).map(toolName).filter((n): n is string => n !== null);
   const missing = ZEN_REQUIRED_TOOL_NAMES.filter((n) => !names.includes(n));
   const present = ZEN_REQUIRED_TOOL_NAMES.length - missing.length;
-  const out = { text: bodyText, injected: [] as string[], present };
-  if (missing.length === 0 || isForcedToolChoice(body.tool_choice)) return out;
+  if (missing.length === 0 || isForcedToolChoice(body.tool_choice)) {
+    return { text: envAdded ? JSON.stringify(body) : bodyText, injected: [], present, envAdded, model };
+  }
   const stubs: Record<string, unknown>[] = [];
   for (const name of missing) {
     const stub = buildStub(url, name);
-    if (!stub) return out;
+    if (!stub) return { text: envAdded ? JSON.stringify(body) : bodyText, injected: [], present, envAdded, model };
     stubs.push(stub);
   }
-  return {
-    text: JSON.stringify({ ...body, tools: tools ? [...tools, ...stubs] : stubs }),
-    injected: missing,
-    present,
-  };
+  body.tools = tools ? [...tools, ...stubs] : stubs;
+  return { text: JSON.stringify(body), injected: missing, present, envAdded, model };
 }
 
 // --- fetch patch -------------------------------------------------------------
@@ -272,6 +341,121 @@ function patchZenHeaders(headers: Headers, sessionId: string): void {
   }
 }
 
+// --- 429 circuit breaker -----------------------------------------------------
+// A 429 that carries `retry-after` on a request which already had the env
+// block is a real free-model limit: the deadline points at 00:00 UTC and each
+// retry before then only costs a round trip (and a wasted prompt cache). A 429
+// without that evidence is the shape check rejecting the body, so it is
+// blocked briefly instead of for the rest of the day. The deadline is kept per
+// model (a per-model cap must not block the other free models) and persisted in
+// tmpdir so separate `omp -p` / `pi -p` runs honour it too, since each run is a
+// new process; delete the file to retry early. The breaker is advisory: the
+// first 429 after a reset is always sent.
+const BREAKER_FILE = join(tmpdir(), "zen-free-tier-limit.json");
+// No `retry-after` (proxy, gateway hiccup, shape rejection): block briefly.
+const DEFAULT_BLOCK_MS = 60_000;
+type BreakerState = Record<string, number>;
+let breakerState: BreakerState | null = null;
+
+async function loadBreaker(): Promise<BreakerState> {
+  if (breakerState) return breakerState;
+  const now = Date.now();
+  const state: BreakerState = {};
+  try {
+    const parsed: unknown = JSON.parse(await readFile(BREAKER_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof value === "number" && Number.isFinite(value) && value > now) state[key] = value;
+      }
+    }
+  } catch {
+    // Missing or unreadable file: start empty.
+  }
+  breakerState = state;
+  return state;
+}
+
+async function noteBlocked(key: string, until: number): Promise<void> {
+  const state = await loadBreaker();
+  state[key] = until;
+  try {
+    await writeFile(BREAKER_FILE, JSON.stringify(state), { mode: 0o600 });
+  } catch {
+    // An unpersisted breaker still protects the current process.
+  }
+}
+
+function retryAfterMs(resp: Response): number | null {
+  const ms = resp.headers.get("retry-after-ms");
+  if (ms !== null && ms !== "") {
+    const n = Number(ms);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const raw = resp.headers.get("retry-after");
+  if (raw === null || raw === "") return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(raw); // HTTP-date form
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+function formatReset(at: number): string {
+  return `${new Date(at).toLocaleString()} (${new Date(at).toISOString().slice(0, 16)}Z)`;
+}
+
+// The model is the only part of a Zen request the bucket is keyed by, so a
+// request that hits a per-model cap must not block the other free models.
+function breakerKey(rawUrl: string, body: BodyInit | null | undefined): string {
+  let model = "unknown";
+  if (typeof body === "string" && body.trimStart().startsWith("{")) {
+    try {
+      const doc = JSON.parse(body) as { model?: unknown };
+      if (typeof doc.model === "string" && doc.model) model = doc.model;
+    } catch {
+      // Not JSON: fall back to the endpoint-wide key.
+    }
+  }
+  try {
+    const url = new URL(rawUrl);
+    return `${url.host}${url.pathname}:${model}`;
+  } catch {
+    return `opencode.ai:${model}`;
+  }
+}
+
+class ZenLimitError extends Error {
+  // Deliberately carries no `status`. omp classifies a thrown error with a
+  // 4xx `status` as non-retryable but also dumps the whole request (prompt
+  // included) to ~/.omp/logs/http-<status>-requests/. Without `status` the
+  // classifier falls through to its message patterns, so the wording below
+  // must avoid `rate limit`, `too many requests`, `timeout` and friends:
+  // those mark the error retryable and omp re-schedules the turn every ~30s.
+  constructor(message: string) {
+    super(message);
+    this.name = "ZenFreeLimitError";
+  }
+}
+
+// omp/pi surface the provider error body verbatim, and the server's body does
+// not say when the bucket refills (only the header does). Appending the reset
+// time is what turns "try later" into an actionable message. Any body that is
+// not the usual JSON error is returned untouched.
+async function annotate429(resp: Response, until: number | null): Promise<Response> {
+  if (until === null || !resp.headers.get("content-type")?.includes("json")) return resp;
+  try {
+    const text = await resp.text();
+    const doc = JSON.parse(text) as { error?: { message?: unknown } };
+    const message = doc?.error?.message;
+    if (typeof message !== "string" || message.includes("resets")) return resp;
+    doc.error!.message = `${message} (free-model bucket resets ${formatReset(until)})`;
+    const headers = new Headers(resp.headers);
+    headers.delete("content-length");
+    return new Response(JSON.stringify(doc), { status: resp.status, statusText: resp.statusText, headers });
+  } catch {
+    return resp;
+  }
+}
+
 const PATCH_FLAG = "__piOpencodeFixV2Patched";
 
 function installFetchPatch(): void {
@@ -295,6 +479,22 @@ function installFetchPatch(): void {
       // String/URL inputs carry a re-sendable inline body; a Request with a
       // stream body is consumed by the first send and cannot be retried.
       const retryable = typeof input === "string" || input instanceof URL || (input as Request).body === null;
+      const limitKey = breakerKey(rawUrl, init?.body);
+
+      // Fail locally while the free bucket is known to be empty. Thrown from
+      // inside the try, so the catch below must rethrow it rather than
+      // falling through to an unpatched send.
+      if (process.env.ZEN_429_BREAKER !== "0") {
+        const until = (await loadBreaker())[limitKey];
+        if (until !== undefined && until > Date.now()) {
+          const model = limitKey.slice(limitKey.lastIndexOf(":") + 1);
+          throw new ZenLimitError(
+            `opencode.ai free model ${model} is unavailable until ${formatReset(until)}; request not sent. ` +
+              `Another call before then only spends a round trip. Use another model, wait, or delete ` +
+              `${BREAKER_FILE} to retry early.`,
+          );
+        }
+      }
 
       let sessionId = await getSessionId();
       for (let attempt = 0; ; attempt++) {
@@ -305,17 +505,24 @@ function installFetchPatch(): void {
           let body = init?.body;
           let injected: string[] = [];
           let present = 0;
-          if (process.env.ZEN_INJECT_TOOLS !== "0" && typeof body === "string" && body.trimStart().startsWith("{")) {
-            const r = injectZenTools(rawUrl, body);
-            injected = r.injected;
-            present = r.present;
-            if (injected.length > 0) {
-              body = r.text;
-              headers.delete("content-length");
+          let envAdded = false;
+          let model = "";
+          if (typeof body === "string" && body.trimStart().startsWith("{")) {
+            if (process.env.ZEN_INJECT_ENV !== "0" || process.env.ZEN_INJECT_TOOLS !== "0") {
+              const r = injectZenTools(rawUrl, body);
+              model = r.model;
+              if (process.env.ZEN_INJECT_ENV !== "0") envAdded = r.envAdded;
+              if (process.env.ZEN_INJECT_TOOLS !== "0") {
+                injected = r.injected;
+                present = r.present;
+              }
+              if (r.text !== body) body = r.text;
+              if (r.text !== init?.body) headers.delete("content-length");
             }
           }
           debugLog(
-            `${rawUrl.split("?")[0]} session=${sessionId.slice(0, 18)} tools=${present} injected=[${injected.join(",")}]`,
+            `${rawUrl.split("?")[0]} model=${model} session=${sessionId.slice(0, 18)} tools=${present} ` +
+              `injected=[${injected.join(",")}] env=${envAdded}`,
           );
           resp = await origFetch.call(this, input, { ...init, headers, body });
         } else {
@@ -327,6 +534,25 @@ function installFetchPatch(): void {
           const req = new Request(input as Request, { headers: merged });
           debugLog(`${(input as Request).url.split("?")[0]} session=${sessionId.slice(0, 18)} request-input`);
           resp = await origFetch.call(this, req, Object.keys(rest).length ? rest : undefined);
+        }
+
+        // A 429 with `retry-after` on a request that carried the env block is
+        // a real bucket limit: remember the refill and fail locally until then.
+        // A 429 on a request that never got the block is the shape check
+        // rejecting it, so block only briefly and let the next call try with a
+        // patched body.
+        if (resp.status === 429) {
+          // Only a request that carried the marker can be genuinely metered.
+          const wait = envAdded ? retryAfterMs(resp) : null;
+          const honored = wait !== null;
+          const until = Date.now() + (wait ?? DEFAULT_BLOCK_MS);
+          if (process.env.ZEN_429_BREAKER !== "0") {
+            await noteBlocked(limitKey, until);
+          }
+          debugLog(
+            `${rawUrl.split("?")[0]} 429 key=${limitKey} env=${envAdded} until=${formatReset(until)}`,
+          );
+          return honored ? annotate429(resp, until) : resp;
         }
 
         // A registered session can go stale mid-run (service restart,
@@ -348,7 +574,10 @@ function installFetchPatch(): void {
         debugLog(`${rawUrl.split("?")[0]} session-stale retry with ${fresh.slice(0, 18)}`);
         sessionId = fresh;
       }
-    } catch {
+    } catch (error) {
+      // The breaker's own error is deliberate: surface it instead of
+      // re-sending the request unpatched.
+      if (error instanceof ZenLimitError) throw error;
       // Fail open: never break a request because the patch hit something odd.
       return origFetch.call(this, input, init);
     }
