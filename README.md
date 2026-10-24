@@ -1,6 +1,6 @@
 # pi-opencode-fix
 
-Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that gives requests to OpenCode Zen the identity and prompt shape of the genuine OpenCode CLI, so free models answer directly in the harness, plus a 429 circuit breaker so a real quota day fails fast with the reset time.
+Extension package for **Pi Coding Agent (`pi`)** and **Oh My Pi (`omp`)** that gives requests to OpenCode Zen the identity and prompt shape of the genuine OpenCode CLI, so free models answer directly in the harness, plus bounded 429 retries that stop the turn after three attempts instead of retrying forever.
 
 ## Problem
 
@@ -69,20 +69,20 @@ its position. Verified live: `omp` 18.12.6 then answered through
 the same turn, and produced reasoning with `--thinking high`; the same works on
 `glm-5.3-flash-free`.
 
-The **429 circuit breaker** stays, because a `429` with `retry-after` can still
-be a real bucket limit:
+A `429` is still possible — a real bucket limit, or the shape check when env
+injection is disabled — and the extension bounds it instead of caching it:
 
-- on a 429 it records the deadline from `retry-after-ms` or `retry-after`,
-  keyed by model, and appends the reset time to the error body, because the
-  server's body does not say when the bucket refills;
-- a 429 on a request that never carried the block (env injection disabled, or
-  a body the patch could not rewrite) is treated as a shape rejection and
-  blocked for a minute instead of a day;
-- later requests for that model fail immediately with `ZenFreeLimitError`
-  naming the reset time, without touching the network;
-- the deadline is persisted in `<tmpdir>/zen-free-tier-limit.json` so separate
-  `omp -p` / `pi -p` runs honour it too (each run is a new process). Delete the
-  file to retry early; `ZEN_429_BREAKER=0` disables the breaker.
+- the same request is re-sent at most three times per turn, after 2 s and 5 s;
+- if the third answer is still `429` the turn stops with a non-retryable `422`
+  that names the model, the attempt count, and the reset time from
+  `retry-after-ms` / `retry-after` when the server sent one. The wording avoids
+  `429` and "rate limit" because omp treats those as retryable, and 422 is
+  outside both its fetch and turn-recovery retry sets, so nothing re-sends the
+  turn and no request body is dumped to disk;
+- nothing is remembered across turns: the limit is shared by IP and account,
+  not by model, and OpenCode itself can start answering again at any time, so a
+  stored deadline would only outlive the real state. The next prompt sends a
+  fresh request.
 
 ## History: the earlier shape check
 
@@ -138,9 +138,8 @@ like the genuine client:
   them (skipped for forced `tool_choice`); see `ZEN_INJECT_TOOLS=0` below.
 
 It also configures static provider headers for `opencode`, `opencode-go`,
-`opencode-zen`, and `oc` in `pi` / `omp`, and keeps a per-model 429 deadline so
-a real free-model quota day fails fast with the reset time instead of
-retrying.
+`opencode-zen`, and `oc` in `pi` / `omp`, and turns a `429` that survives three
+attempts into a stopped turn with the reset time instead of an endless retry.
 
 Prerequisites for the registered-session path: `opencode` installed (1.18.0
 or newer; 2.1.4 verified) and its background service running
@@ -152,11 +151,9 @@ Env:
 - `ZEN_INJECT_ENV=0` — disable env-block injection (headers and tools still
   patched; requests are answered with `429 FreeUsageLimitError`)
 - `ZEN_INJECT_TOOLS=0` — disable tool-stub injection (headers still patched)
-- `ZEN_429_BREAKER=0` — disable the 429 circuit breaker (requests are still
-  annotated with the reset time)
 - `ZEN_HEADERS_DEBUG=1` — append one line per Zen request to
   `<tmpdir>/zen-free-tier-headers.log` (path, session prefix, tool and env
-  flags, 429 deadline; never keys)
+  flags, retry count and reset time; never keys)
 - `OPENCODE_SERVER_URL` — override the background service URL
 
 Known limits:
@@ -164,8 +161,8 @@ Known limits:
 - The env check is server-side and undocumented; a future change can add a
   condition this extension does not satisfy. The flags above and
   `ZEN_HEADERS_DEBUG=1` are there to tell a shape rejection (`429` with no
-  request in the log, or `403`) apart from a real limit (`429` with
-  `retry-after`).
+  request in the log, or `403`) apart from a real limit (three logged requests,
+  `retry-after` present).
 - One Zen request per `omp` run bypassed `globalThis.fetch` with `omp/18.10.2`
   despite the patch and could not be patched from an extension. On
   `omp/18.12.6` headless runs, every observed Zen call went through the
@@ -262,38 +259,6 @@ example is verified live; `pi` is not verified here (no Zen credential for
 `pi` on the author's machine), and its catalog may lag — `pi update --models`
 refreshes it, and an id missing from the catalog is sent as a custom model
 id.
-
-## Free models through the relay (`zen_ask`)
-
-`extensions/zen-relay.ts` registers a `zen_ask` tool that runs the genuine
-`opencode` binary (`opencode run --model opencode/<id>`) and returns its text
-answer. It was written while the gateway refused `pi`/`omp` outright; direct
-access works again, so treat it as an optional second opinion or isolation
-path rather than the only way in. It inherits the real client identity, so it
-keeps working even if the gateway adds a check this extension does not
-satisfy. The nested run is a full agent turn with its own tools in the session
-directory — text in, text out. It cannot use the harness's tools or see its
-conversation, so put everything it needs in `prompt`. Only free models are
-accepted (id ends in `-free`, plus `big-pickle`; e.g.
-`deepseek-v4.1-flash-free`, `glm-5.3-flash-free`) — anything else is refused
-before running, so the relay can never spend Zen credits.
-
-Params: `prompt` (required), `model` (default
-`deepseek-v4.1-flash-free`), `timeoutMs` (default 180000, max 600000),
-`autoApprove` (default false: reads and answers work, permission-gated writes
-are denied; set true for coding tasks — same trust as the session's own
-edit/bash tools), `session` (a `[session: ses_…]` id from a previous answer,
-for multi-turn continuity; the CLI now accepts a shape-valid invented id, but
-follow-up answers only carry context for a real one).
-Answers name the nested run's tools (`[Nested opencode run used tools: …]`)
-and carry the nested session id for follow-ups. Output is capped at ~20k
-chars. Child stdin is closed so a prompt the CLI cannot ask (trust,
-permissions) fails fast instead of hanging; set `OPENCODE_BIN` to override
-the binary path.
-
-Requires `opencode` 1.18.0 or newer (2.0.32 verified) installed and signed in
-(`opencode auth login`; `opencode service start` or one TUI launch for the
-background service).
 
 ## License
 

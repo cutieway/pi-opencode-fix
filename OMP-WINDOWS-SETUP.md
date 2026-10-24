@@ -71,7 +71,7 @@ Paste exactly this content and save:
 
 ```typescript
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile, writeFile, appendFile } from "node:fs/promises";
+import { readFile, appendFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
@@ -413,48 +413,18 @@ function patchZenHeaders(headers: Headers, sessionId: string): void {
   }
 }
 
-// --- 429 circuit breaker -----------------------------------------------------
-// A 429 that carries `retry-after` on a request which already had the env
-// block is a real free-model limit: the deadline points at 00:00 UTC and each
-// retry before then only costs a round trip (and a wasted prompt cache). A 429
-// without that evidence is the shape check rejecting the body, so it is
-// blocked briefly instead of for the rest of the day. The deadline is kept per
-// model (a per-model cap must not block the other free models) and persisted in
-// tmpdir so separate `omp -p` / `pi -p` runs honour it too, since each run is a
-// new process; delete the file to retry early. The breaker is advisory: the
-// first 429 after a reset is always sent.
-const BREAKER_FILE = join(tmpdir(), "zen-free-tier-limit.json");
-// No `retry-after` (proxy, gateway hiccup, shape rejection): block briefly.
-const DEFAULT_BLOCK_MS = 60_000;
-type BreakerState = Record<string, number>;
-let breakerState: BreakerState | null = null;
+// --- 429 handling ------------------------------------------------------------
+// Zen's 429 is shared by IP and account, not by model, so there is nothing to
+// split per model and no cooldown worth persisting: a stored deadline outlives
+// the real state, while OpenCode itself can start working again at any moment.
+// One turn re-sends the request at most three times in quick succession to ride
+// out a transient window. If the last answer is still 429 the turn stops with a
+// non-retryable 422 — no model fallback, no ~30 s re-schedule — and the next
+// prompt simply sends a fresh request, so a recovered OpenCode works immediately.
+const RETRY_429_DELAYS_MS = [2_000, 5_000];
 
-async function loadBreaker(): Promise<BreakerState> {
-  if (breakerState) return breakerState;
-  const now = Date.now();
-  const state: BreakerState = {};
-  try {
-    const parsed: unknown = JSON.parse(await readFile(BREAKER_FILE, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof value === "number" && Number.isFinite(value) && value > now) state[key] = value;
-      }
-    }
-  } catch {
-    // Missing or unreadable file: start empty.
-  }
-  breakerState = state;
-  return state;
-}
-
-async function noteBlocked(key: string, until: number): Promise<void> {
-  const state = await loadBreaker();
-  state[key] = until;
-  try {
-    await writeFile(BREAKER_FILE, JSON.stringify(state), { mode: 0o600 });
-  } catch {
-    // An unpersisted breaker still protects the current process.
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function retryAfterMs(resp: Response): number | null {
@@ -475,57 +445,38 @@ function formatReset(at: number): string {
   return `${new Date(at).toLocaleString()} (${new Date(at).toISOString().slice(0, 16)}Z)`;
 }
 
-// The model is the only part of a Zen request the bucket is keyed by, so a
-// request that hits a per-model cap must not block the other free models.
-function breakerKey(rawUrl: string, body: BodyInit | null | undefined): string {
-  let model = "unknown";
-  if (typeof body === "string" && body.trimStart().startsWith("{")) {
-    try {
-      const doc = JSON.parse(body) as { model?: unknown };
-      if (typeof doc.model === "string" && doc.model) model = doc.model;
-    } catch {
-      // Not JSON: fall back to the endpoint-wide key.
-    }
-  }
+function modelFromBody(body: BodyInit | null | undefined): string {
+  if (typeof body !== "string" || !body.trimStart().startsWith("{")) return "unknown";
   try {
-    const url = new URL(rawUrl);
-    return `${url.host}${url.pathname}:${model}`;
+    const doc = JSON.parse(body) as { model?: unknown };
+    return typeof doc.model === "string" && doc.model ? doc.model : "unknown";
   } catch {
-    return `opencode.ai:${model}`;
+    return "unknown";
   }
 }
 
-class ZenLimitError extends Error {
-  // Deliberately carries no `status`. omp classifies a thrown error with a
-  // 4xx `status` as non-retryable but also dumps the whole request (prompt
-  // included) to ~/.omp/logs/http-<status>-requests/. Without `status` the
-  // classifier falls through to its message patterns, so the wording below
-  // must avoid `rate limit`, `too many requests`, `timeout` and friends:
-  // those mark the error retryable and omp re-schedules the turn every ~30s.
-  constructor(message: string) {
-    super(message);
-    this.name = "ZenFreeLimitError";
-  }
+function limitMessage(model: string, attempts: number, resetAt: number | null): string {
+  // Neither the server body nor the status digit is reused: omp's retry
+  // classifier marks "rate limit", "too many requests", and a bare status
+  // number like "429" as retryable, which would re-schedule the stopped turn.
+  const reset =
+    resetAt === null ? "" : ` The free-tier bucket is expected to reset ${formatReset(resetAt)}.`;
+  return (
+    `opencode.ai free model ${model} kept answering the free-tier rejection on ${attempts} attempts.${reset} ` +
+    `The turn was stopped; your next prompt sends a fresh request.`
+  );
 }
 
-// omp/pi surface the provider error body verbatim, and the server's body does
-// not say when the bucket refills (only the header does). Appending the reset
-// time is what turns "try later" into an actionable message. Any body that is
-// not the usual JSON error is returned untouched.
-async function annotate429(resp: Response, until: number | null): Promise<Response> {
-  if (until === null || !resp.headers.get("content-type")?.includes("json")) return resp;
-  try {
-    const text = await resp.text();
-    const doc = JSON.parse(text) as { error?: { message?: unknown } };
-    const message = doc?.error?.message;
-    if (typeof message !== "string" || message.includes("resets")) return resp;
-    doc.error!.message = `${message} (free-model bucket resets ${formatReset(until)})`;
-    const headers = new Headers(resp.headers);
-    headers.delete("content-length");
-    return new Response(JSON.stringify(doc), { status: resp.status, statusText: resp.statusText, headers });
-  } catch {
-    return resp;
-  }
+// The final answer is not a 429: omp's fetch retry layer retries 429s (and any
+// thrown error) ten times, and its turn recovery retries a 429 again. A 422 is
+// outside both retry sets, so the turn stops after the attempts above. It is
+// also not 400/413, the only statuses whose rejected request omp dumps to disk.
+function stopResponse(body: string): Response {
+  return new Response(JSON.stringify({ error: { message: body, type: "free_tier_unavailable" } }), {
+    status: 422,
+    statusText: "Unprocessable Content",
+    headers: { "content-type": "application/json" },
+  });
 }
 
 const PATCH_FLAG = "__piOpencodeFixV2Patched";
@@ -551,25 +502,12 @@ function installFetchPatch(): void {
       // String/URL inputs carry a re-sendable inline body; a Request with a
       // stream body is consumed by the first send and cannot be retried.
       const retryable = typeof input === "string" || input instanceof URL || (input as Request).body === null;
-      const limitKey = breakerKey(rawUrl, init?.body);
-
-      // Fail locally while the free bucket is known to be empty. Thrown from
-      // inside the try, so the catch below must rethrow it rather than
-      // falling through to an unpatched send.
-      if (process.env.ZEN_429_BREAKER !== "0") {
-        const until = (await loadBreaker())[limitKey];
-        if (until !== undefined && until > Date.now()) {
-          const model = limitKey.slice(limitKey.lastIndexOf(":") + 1);
-          throw new ZenLimitError(
-            `opencode.ai free model ${model} is unavailable until ${formatReset(until)}; request not sent. ` +
-              `Another call before then only spends a round trip. Use another model, wait, or delete ` +
-              `${BREAKER_FILE} to retry early.`,
-          );
-        }
-      }
+      const requestModel = modelFromBody(init?.body);
 
       let sessionId = await getSessionId();
-      for (let attempt = 0; ; attempt++) {
+      let rateLimitAttempts = 0;
+      let staleRetried = false;
+      for (;;) {
         let resp: Response;
         if (typeof input === "string" || input instanceof URL) {
           const headers = new Headers(init?.headers);
@@ -608,31 +546,41 @@ function installFetchPatch(): void {
           resp = await origFetch.call(this, req, Object.keys(rest).length ? rest : undefined);
         }
 
-        // A 429 with `retry-after` on a request that carried the env block is
-        // a real bucket limit: remember the refill and fail locally until then.
-        // A 429 on a request that never got the block is the shape check
-        // rejecting it, so block only briefly and let the next call try with a
-        // patched body.
+        // A 429 is shared by IP/account, so the same request is re-sent a few
+        // times to ride out a transient window. Once the attempts are spent the
+        // turn stops here: a 429 would be retried again by omp, and any stored
+        // cooldown would outlive a recovered OpenCode state. See stopResponse.
         if (resp.status === 429) {
-          // Only a request that carried the marker can be genuinely metered.
-          const wait = envAdded ? retryAfterMs(resp) : null;
-          const honored = wait !== null;
-          const until = Date.now() + (wait ?? DEFAULT_BLOCK_MS);
-          if (process.env.ZEN_429_BREAKER !== "0") {
-            await noteBlocked(limitKey, until);
+          const resetAt = retryAfterMs(resp);
+          const until = resetAt === null ? null : Date.now() + resetAt;
+          if (rateLimitAttempts < RETRY_429_DELAYS_MS.length && retryable) {
+            const delay = RETRY_429_DELAYS_MS[rateLimitAttempts++];
+            debugLog(
+              `${rawUrl.split("?")[0]} 429 model=${requestModel} retry=${rateLimitAttempts}/${RETRY_429_DELAYS_MS.length} ` +
+                `in=${delay}ms`,
+            );
+            try {
+              await resp.body?.cancel();
+            } catch {
+              // Release the socket; ignore errors.
+            }
+            await sleep(delay);
+            continue;
           }
           debugLog(
-            `${rawUrl.split("?")[0]} 429 key=${limitKey} env=${envAdded} until=${formatReset(until)}`,
+            `${rawUrl.split("?")[0]} 429 model=${requestModel} attempts=${rateLimitAttempts + 1} ` +
+              `until=${until === null ? "unknown" : formatReset(until)} stop`,
           );
-          return honored ? annotate429(resp, until) : resp;
+          return stopResponse(limitMessage(requestModel, rateLimitAttempts + 1, until));
         }
 
         // A registered session can go stale mid-run (service restart,
         // pruning): on 403 drop it and retry once with a fresh session,
         // within the rotation cap. Past the cap, fail open: the 403 is
         // almost certainly a gate verdict, not a stale session.
-        if (resp.status !== 403 || attempt > 0 || !retryable) return resp;
+        if (resp.status !== 403 || staleRetried || !retryable) return resp;
         if (sessionRotations >= MAX_SESSION_ROTATIONS) return resp;
+        staleRetried = true;
         sessionRotations++;
         try {
           await resp.body?.cancel();
@@ -647,9 +595,6 @@ function installFetchPatch(): void {
         sessionId = fresh;
       }
     } catch (error) {
-      // The breaker's own error is deliberate: surface it instead of
-      // re-sending the request unpatched.
-      if (error instanceof ZenLimitError) throw error;
       // Fail open: never break a request because the patch hit something odd.
       return origFetch.call(this, input, init);
     }
@@ -686,7 +631,7 @@ Test-Path "$env:USERPROFILE\.omp\agent\extensions\opencode-fix.ts"
 Get-Content "$env:USERPROFILE\.omp\agent\extensions\opencode-fix.ts" | Measure-Object -Line
 ```
 
-Expect `True` and around 380 lines. `omp` scans `<agent dir>\extensions\` and loads each file it finds there.
+Expect `True` and around 550 lines. `omp` scans `<agent dir>\extensions\` and loads each file it finds there.
 
 Restart `omp` afterwards: extensions load at startup, so an already-running session will not see it.
 
@@ -719,14 +664,19 @@ This should list `opencode-zen`. The key is stored in `%USERPROFILE%\.omp\agent\
 Edit `%USERPROFILE%\.omp\agent\config.yml`, creating it if it does not exist. Merge these keys into whatever is already there instead of replacing the file:
 
 ```yaml
+# Role writes from `/model` land in this global file, not a project config, so
+# a model switch survives restarts and applies in every directory.
+modelRoleStorage: global
 modelRoles:
-  # The reviewer and the tool-less auxiliary tasks use a free model.
-  advisor: opencode-zen/glm-5.3-flash-free
-  tiny: opencode-zen/glm-5.3-flash-free
-  default: opencode-zen/deepseek-v4.1-flash-free
-  # Every other chat role follows the default role through `*`. Roles other
-  # than smol/slow inherit nothing on their own, so an unset plan, commit,
-  # vision, memory, or task can resolve to a paid model instead.
+  # The main chat model. Every role below is `*`, which means "follow this one".
+  default: opencode-zen/deepseek-v4.1-flash-free:high
+  # The reviewer keeps its own model; making it `*` would leave the advisor as a
+  # second copy of the main agent.
+  advisor: opencode-zen/mimo-v2.6-flash-free:high
+  # A hardcoded role ignores a later main-model switch, and an unset role can
+  # resolve to a paid model. Roles other than smol/slow inherit nothing on their
+  # own, so list every one.
+  tiny: "*"
   smol: "*"
   slow: "*"
   memory: "*"
@@ -734,8 +684,12 @@ modelRoles:
   commit: "*"
   task: "*"
   vision: "*"
+  judge: "*"
+  widget: "*"
 advisor:
-  enabled: true
+  # Off by default: a reviewer doubles requests against the same IP-wide
+  # free-tier limit. Set true to use modelRoles.advisor as a second opinion.
+  enabled: false
 ```
 
 Confirm it parses:
@@ -746,12 +700,20 @@ omp config get modelRoles
 
 Both models named above are free Zen models and both serve chat completions.
 `deepseek-v4.1-flash-free` is the current general-purpose free model;
-`glm-5.3-flash-free` is the free reviewer. Do not use
-`muse-spark-1.3-contributor-free` or `space-bunny-free`: both were retired and
-now return 410 `ModelDeprecated`. Do not add a `retry.fallbackChains` entry
-unless every model in it is free — a chain that ends on a paid model spends
-money silently when the free one is refused. Check `omp models find free`
-before choosing a different id.
+`mimo-v2.6-flash-free` is a free reviewer. `:high` is the reasoning level and can
+be dropped or changed per role. Do not use `muse-spark-1.3-contributor-free` or
+`space-bunny-free`: both were retired and now return 410 `ModelDeprecated`. Do
+not add a `retry.fallbackChains` entry unless every model in it is free — a
+chain that ends on a paid model spends money silently when the free one is
+refused. Check `omp models find free` before choosing a different id.
+
+`"*"` is `omp`'s alias for the `default` role, so a later main-model switch
+moves every role that uses it. Switch models with `/model`: the picker writes
+`modelRoles` to the global `config.yml` (because of `modelRoleStorage: global`),
+so the choice survives restarts instead of living in one project. The reviewer
+is switched the same way, through `/model` → Roles → Advisor, which writes
+`modelRoles.advisor`; a per-project `WATCHDOG.yml` must not carry a `model:` key
+or it overrides that.
 
 ## Step 4 — (Optional) Give the advisor a larger tool slate
 
@@ -781,7 +743,9 @@ advisors:
 ```
 
 Everything else about the advisor keeps its defaults: the model comes from
-`modelRoles.advisor`, and the system prompt is built in.
+`modelRoles.advisor`, and the system prompt is built in. The file is a roster,
+so it must not carry a `model:` key. It only takes effect when
+`advisor.enabled` is `true`.
 
 One consequence to state plainly to the user: this makes the advisor a full
 agent, able to edit files and run commands through those tools. If a
@@ -800,7 +764,8 @@ appears but the log shows `403 ... (type=FreeTierError)` or `429 ...
 (type=FreeUsageLimitError)` followed by a fallback model, the extension is not
 loaded — recheck Step 1 rather than the model roles.
 
-Then start an interactive session so the advisor fires on the reply:
+If `advisor.enabled` is `true`, start an interactive session so the advisor
+fires on the reply:
 
 ```powershell
 omp
@@ -842,7 +807,8 @@ Reading the results:
 |---|---|
 | `403` with `error code: 1010` | Cloudflare refused it outright — no OpenCode identity at all, so the extension is not loaded or not applied. Check the file path and restart. |
 | `403` with `{"type":"error","error":{"type":"FreeTierError",...}}` | The gateway disliked the identity or refused this request shape (headers, `read` tool, or streaming). |
-| `429` with `{"type":"error","error":{"type":"FreeUsageLimitError",...}}` | The system message lacked an `<env>…</env>` block, or a real free-model quota is spent. Check the `retry-after` header: a value pointing at 00:00 UTC means the shape check rejected the request (the extension should have added the block); no header means a real limit. |
+| `429` with `{"type":"error","error":{"type":"FreeUsageLimitError",...}}` | The system message lacked an `<env>…</env>` block, or a real free-model quota is active. The extension retries the request twice with short waits, so up to three of these per turn are expected. A `retry-after` pointing at 00:00 UTC usually means the shape check rejected the request, since the extension should have added the block. |
+| `422` with `"type":"free_tier_unavailable"` | The extension gave up after three `429`s and stopped the turn. Nothing is blocked and no request was dumped to disk. Wait for the bucket if the `429` was real, or re-check the env injection with `ZEN_HEADERS_DEBUG=1`, then send a new prompt: it goes out immediately. |
 | `426 UpgradeRequired` | The installed `opencode` is older than 1.18.0; upgrade it (the extension sends its version as the `User-Agent`). |
 | `410 ModelDeprecated` | The chosen free model was retired; run `omp models find free` and update Step 3. |
 | `402 Payment Required` | A paid Zen model was requested with no credits — a model role or fallback points at a paid model; recheck Step 3. |

@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-fix",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Fix HTTP 403 FreeTierError and HTTP 429 when calling OpenCode Zen free models from Pi and Oh My Pi (omp)",
   "main": "extensions/opencode-fix.ts",
   "keywords": [
@@ -18,8 +18,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/opencode-fix.ts",
-      "./extensions/zen-relay.ts"
+      "./extensions/opencode-fix.ts"
     ]
   },
   "peerDependencies": {
